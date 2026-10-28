@@ -1,0 +1,457 @@
+======================================================================
+ COGNIFY - AIR-GAPPED PREDICTIVE COGNIFY FOR SECURE MPLS OPERATIONS
+ Viva preparation: questions and answers
+======================================================================
+
+Project folder : C:\Users\anjur\mpls-copilot-poc
+Main files     : C:\Users\anjur\mpls-copilot-poc\prepare_cisco_data.py   (raw data -> clean CSV)
+                 C:\Users\anjur\mpls-copilot-poc\detector.py             (ML model and checks)
+                 C:\Users\anjur\mpls-copilot-poc\server.py               (local API server)
+                 C:\Users\anjur\mpls-copilot-poc\frontend\               (React dashboard)
+                 C:\Users\anjur\mpls-copilot-poc\data\router_metrics.csv (clean data, 5,400 rows)
+                 C:\Users\anjur\mpls-copilot-poc\raw_data\cisco_portflap\ (original public dataset)
+Run            : open a terminal in the project folder, then
+                   .\venv\Scripts\activate
+                   python server.py
+                 and open http://localhost:8000
+
+
+======================================================================
+PART A - THE FULL ANALYSIS, STEP BY STEP
+(How Cognify decides whether a reading is normal or abnormal)
+======================================================================
+
+STEP 1 - Get the raw data
+  - Public Cisco IOS-XR telemetry dataset (github.com/cisco-ie/telemetry, folder 4).
+  - 15 real Cisco routers in a lab, 1 September 2017, about 1 hour.
+  - Each router streams readings every ~5 seconds: CPU, memory, interface
+    counters, interface up/down state, BGP sessions.
+  - About 1.2 million raw rows (one row per router, per reading type, per interface).
+  - During the hour, engineers caused 6 faults on purpose and wrote down when
+    and where (the "event log", file portflap_casedata.txt).
+
+STEP 2 - Clean and reshape the data  (prepare_cisco_data.py)
+  - Group the raw rows into one row per router every 10 seconds.
+  - Calculate 7 metrics per row:
+      cpu_util_pct        CPU use in % (1-minute average reported by the router)
+      mem_util_pct        memory in use: 100 x (1 - free memory / total memory)
+      bandwidth_util_pct  traffic in + out, as % of interface capacity
+      packet_loss_pct     new dropped packets / new packets x 100
+      interface_errors    new input errors + output errors + CRC errors
+      interfaces_down     number of interfaces whose state is not "up"
+      bgp_peers_down      BGP neighbours configured - BGP neighbours connected
+  - Counters (errors, drops, packets) only ever grow, so we take the increase
+    since the previous reading. A negative jump means the counter was reset, so we use 0.
+  - If a value is missing in a 10-second slot, we carry the last known value forward.
+  - Add the label column scenario_label from the event log:
+      admin_down, fiber_pull, transceiver_pull, or normal.
+  - Result: 5,400 rows (15 routers x 360 time slots), 282 rows (5.2%) are faults.
+
+STEP 3 - Split the data 75% / 25%  (detector.py, split_train_test)
+  - 4,050 rows for training, 1,350 rows for testing.
+  - Random split, "stratified": both parts get the same share of fault rows (5.2%).
+  - The test rows are never used to train, so they show how the model does on new data.
+
+STEP 4 - Learn each router's normal behaviour  (detector.py, train_model)
+  From the TRAINING rows only, for every router and every metric:
+  - normal level   = the median value
+  - hard limits    = lowest value - margin  and  highest value + margin,
+                     where margin = 5 x standard deviation (at least 1)
+
+STEP 5 - Turn each reading into "distance from its own normal"
+  - For every reading: value - that router's median, for all 7 metrics.
+  - Example: edge router dr03 normally has 59 interfaces down (unused ports),
+    spine2 normally has 0. Without this step the model would just flag dr03
+    for being "different from the others", which is not a fault.
+
+STEP 6 - Train Isolation Forest
+  - scikit-learn IsolationForest, 100 trees, contamination = 0.05, random_state = 42.
+  - Trained on the "distance from normal" values of the training rows.
+  - The label column is NEVER given to the model.
+
+STEP 7 - Check every reading with TWO checks  (detector.py, detect)
+  Check 1 - Hard limit (rule):
+    Is any metric outside its router's hard limits?  If yes -> unusual.
+  Check 2 - Isolation Forest (ML):
+    The model works out how many random "cuts" it needs to isolate the reading.
+      typical normal reading : about 15 cuts
+      cut-off                : 9.2 cuts
+      real fault readings    : about 5-6 cuts
+    Fewer cuts than the cut-off -> unusual.
+  Final answer:
+    Anomaly if Check 1 OR Check 2 says unusual, otherwise Normal.
+  Each flagged row also records which check fired: "ML", "Limit", or "ML + limit".
+
+STEP 8 - Evaluate on the test rows  (detector.py, evaluate)
+  - Compare predictions with scenario_label (any label other than "normal" = fault).
+  - Results at contamination 5%:
+      Precision 0.56   Recall 0.66   F1-score 0.61
+      Confusion matrix (1,350 test rows):
+                         model Normal   model Anomaly
+        really normal        1242            37        (37 false alarms)
+        really fault           24            47        (24 missed, 47 caught)
+      Flagged per scenario: admin_down 67%, fiber_pull 73%,
+                            transceiver_pull 63%, normal rows 2.9%
+  - Whole dataset: 5,400 checked, 287 anomalies (286 by ML, 1 by the limit rule).
+
+STEP 9 - Show it on the dashboard (4 tabs)
+  1 Dataset            - source, size, observations, each router's normal level
+  2 Detection results  - counts, charts over time (red dots = flagged,
+                         grey bands = real faults), table of flagged readings
+  3 Evaluation         - precision, recall, F1, confusion matrix
+  4 Test a data point  - pick or type a reading, see Steps 1-4 of the decision
+
+
+======================================================================
+PART B - VIVA QUESTIONS AND ANSWERS
+======================================================================
+
+----------------------------------------------------------------------
+B1. THE PROJECT
+----------------------------------------------------------------------
+
+Q1. What problem does your project solve?
+A.  Network operators watch many routers and cannot look at every number all
+    the time. Cognify automatically points out readings that are unusual, so an
+    engineer knows where to look first. It runs fully offline, for secure
+    networks that are not connected to the internet (air-gapped).
+
+Q2. What does "air-gapped" mean and how is your project air-gapped?
+A.  Air-gapped means the system is physically cut off from the internet.
+    Cognify needs no internet at run time:
+    - all data is a local CSV file,
+    - the model runs locally with scikit-learn (no cloud AI or API),
+    - the server only listens on 127.0.0.1, so other machines cannot reach it,
+    - the dashboard is pre-built into local files, with no fonts or scripts
+      loaded from the internet,
+    - FastAPI's online docs page is switched off because it loads files from the web.
+
+Q3. What does "predictive" mean in your project title?
+A.  It flags unusual behaviour early, so an engineer can act before it becomes
+    a bigger outage. Honestly, this POC detects anomalies as they happen; true
+    forecasting (predicting a failure minutes ahead) is future work.
+
+Q4. Is this a production system?
+A.  No. It is a proof of concept on recorded lab data. It does not connect to
+    real routers, does not change configurations, and has not been tested on
+    live traffic.
+
+----------------------------------------------------------------------
+B2. THE DATASET
+----------------------------------------------------------------------
+
+Q5. Which dataset did you use?
+A.  The public Cisco IOS-XR telemetry dataset by Cisco Innovation Edge,
+    github.com/cisco-ie/telemetry, folder 4 "Port State Changes".
+    Paper: Putina, Rossi, Bifet, Barth, Pletcher, Precup, Nivaggioli,
+    "Telemetry-based stream-learning of BGP anomalies", ACM SIGCOMM
+    Big-DAMA Workshop, 2018.
+
+Q6. Why did you choose this dataset?
+A.  - It is REAL router data from Cisco routers, not made up.
+    - It is public and linked to a published research paper, so it can be cited.
+    - It has an event log saying exactly when and where each fault happened,
+      so we can check our results (precision, recall).
+    - It has the router metrics we need: CPU, memory, traffic, errors, drops,
+      interface state and BGP sessions.
+    - It is small enough (24 MB) to run on a laptop.
+
+Q7. Why not make your own (synthetic) data?
+A.  We considered it, but with simulated data we would only be detecting the
+    patterns we invented ourselves. Real data is harder and more honest, and
+    it has a citable source.
+
+Q8. Why not another dataset, like KDD99, CIC-IDS or Kaggle network data?
+A.  Those are about security attacks or network flows (IP addresses, ports),
+    not router health metrics. We did not find any other public, labelled
+    dataset with router CPU, memory, errors and interface state together.
+
+Q9. What are the routers in the dataset?
+A.  The lab is a spine-leaf network, like a road system:
+    - spine1-4 : the "highways", core routers in the middle
+    - leaf1-8  : the "on-ramps", connecting the outer network to the spines
+    - dr01-03  : big edge routers with 72 ports each, most of them unused,
+                 so they always show 50+ interfaces down (normal for them)
+    The names come from the dataset; we did not choose them.
+
+Q10. What faults are in the data?
+A.   Six faults, all on the cable between leaf3 and spine2:
+     10:15-10:19  optical transceiver pulled (local)
+     10:21-10:25  optical transceiver pulled (remote)
+     10:28-10:33  port shut down by admin (local)
+     10:35-10:38  port shut down by admin (remote)
+     10:43-10:46  fibre cable pulled (local)
+     10:48-10:50  fibre cable pulled (remote)
+
+Q11. Your title says MPLS, but the dataset is a data-centre network. Why is that OK?
+A.   The routers are Cisco IOS-XR, the same operating system used on MPLS
+     provider routers, and the metrics (CPU, memory, interface errors,
+     interface state, BGP) are the same ones an MPLS operator monitors. The
+     method does not depend on the protocol. MPLS-specific metrics such as
+     LDP sessions and label-switched path state are future work.
+
+Q12. Why is there no latency metric?
+A.   Routers do not report their own latency in this telemetry. Latency needs
+     active probes such as Cisco IP SLA or TWAMP that send test packets.
+     That is future work.
+
+Q13. Why did you make 10-second rows?
+A.   Routers report every ~5 seconds but not at exactly the same moment, and
+     different readings arrive at different times. 10 seconds gives every
+     router one complete row with all 7 metrics, and keeps the data small
+     (5,400 rows).
+
+Q14. How did you get the labels?
+A.   From the dataset's own event log (portflap_casedata.txt). A row is
+     labelled with the fault name if its router was involved and its time is
+     inside the fault window; otherwise it is "normal". The model never sees
+     these labels; we only use them to check the results.
+
+Q15. Are the labels perfect?
+A.   No. The log only has minute-level times, so the edges of each fault are
+     approximate. Also, other routers may react to a fault (traffic moves to
+     other paths) but are still labelled "normal", so some "false alarms" may
+     actually be real side effects.
+
+Q16. What did you notice in the data before modelling?
+A.   - Faults only appear on leaf3 and spine2.
+     - Measured against each router's own normal, only interfaces_down (+1.2
+       standard deviations) and bgp_peers_down (+1.2) clearly rise during faults.
+     - CPU, packet loss and interface errors hardly change, so a fault is not
+       always "high CPU".
+     - Routers have very different normal levels (0 interfaces down on spines,
+       59 on dr03), which is why we compare each router with itself.
+
+----------------------------------------------------------------------
+B3. THE MODEL - ISOLATION FOREST
+----------------------------------------------------------------------
+
+Q17. What is Isolation Forest?
+A.   An unsupervised anomaly detection algorithm (Liu, Ting and Zhou, 2008).
+     Idea: unusual points are FEW and DIFFERENT, so they are easy to separate.
+     It builds many random trees. Each tree keeps picking a random metric and a
+     random split value until each point is alone. A normal point is surrounded
+     by similar points, so it needs many cuts. An unusual point is alone after
+     a few cuts. The average number of cuts over all trees gives the anomaly score.
+
+Q18. Explain it with your own numbers.
+A.   A typical normal reading needs about 15 cuts. A real fault reading needs
+     about 5-6 cuts. Anything that needs fewer than 9.2 cuts is called unusual.
+
+Q19. Why did you choose Isolation Forest?
+A.   - It is unsupervised: it does not need labelled faults to train. In real
+       networks labelled faults are rare and new kinds of fault keep appearing.
+     - It is fast and works well with many metrics at once.
+     - It does not need the data to be scaled.
+     - It is easy to explain (count the cuts).
+     - It runs on a laptop with scikit-learn, no GPU and no internet.
+     - The project brief asked for it.
+
+Q20. Why not supervised learning (e.g. Random Forest, SVM classifier)?
+A.   A classifier only learns the fault types it has seen. We have only 282
+     fault rows of 3 types. In a real network new faults appear that were never
+     labelled. Anomaly detection learns what "normal" looks like and flags
+     anything different.
+
+Q21. Why not other anomaly detection methods?
+A.   - One-Class SVM: needs scaling and careful tuning, slower on bigger data.
+     - Local Outlier Factor: based on distances, so sensitive to scale, and
+       slower to score new points.
+     - Autoencoders / LSTM: need much more data and computing power, and are
+       harder to explain.
+     - Simple thresholds only: miss faults where no single metric is extreme
+       but the combination is unusual.
+     Isolation Forest is a good balance of accuracy, speed and explainability.
+
+Q22. What are the model settings and why?
+A.   n_estimators = 100   : 100 trees, the standard default; enough for stable scores.
+     contamination = 0.05 : expect about 5% of readings to be unusual; our
+                            data has 5.2% fault rows.
+     random_state = 42    : fixed seed, so results are the same every run.
+     max_samples = 256    : default; each tree uses a random sample of 256 rows.
+
+Q23. What does contamination do?
+A.   It sets the cut-off. With 0.05, the 5% most unusual training rows fall
+     below the cut-off. Higher contamination = more alarms = higher recall but
+     lower precision. At 10%: recall 0.69 but precision drops to 0.36.
+
+Q24. What is the anomaly score?
+A.   scikit-learn's decision_function. Below 0 = unusual, 0 or above = normal.
+     It comes from the average number of cuts. We also show the number of cuts
+     on the dashboard because it is easier to explain.
+
+Q25. Does the model ever see scenario_label?
+A.   No. Only the 7 metric columns go into the model. The label is used only
+     after prediction, to measure precision and recall.
+
+----------------------------------------------------------------------
+B4. OUR TWO IMPROVEMENTS
+----------------------------------------------------------------------
+
+Q26. What is the per-router baseline and why did you add it?
+A.   Before training, we subtract each router's own median from its readings,
+     so the model sees "how far this router is from ITS normal". Routers differ
+     a lot: dr03 always has 59 interfaces down, spines have 0. Without the
+     baseline, the model mostly flagged the dr routers for simply being
+     different. F1 went from about 0.25 to 0.61 after adding it.
+
+Q27. Why the median and not the mean?
+A.   The median is not pulled by extreme values. Fault readings inside the
+     training data would push the mean, but hardly change the median.
+
+Q28. Why did you add the hard-limit rule (Check 1)?
+A.   When we tested made-up spikes, Isolation Forest alone missed them. A CPU of
+     95% on a router that never went above 30% still scored as normal (9.6 cuts,
+     above the 9.2 cut-off). The reason: Isolation Forest only cuts within the
+     range of values it saw in training, so a value far outside that range is
+     treated like the most extreme training value. The hard limit catches these
+     single extreme values. Real monitoring systems also combine ML with
+     thresholds.
+
+Q29. How is the hard limit calculated? Why 5 standard deviations?
+A.   For each router and metric: lowest training value - 5 standard deviations,
+     and highest training value + 5 standard deviations (margin at least 1).
+     We start from the min/max that already happened, and add a wide margin so
+     normal noise never triggers it. On the real data it adds only 1 extra
+     flagged row and does not change F1, but it catches every made-up spike.
+
+Q30. So which check finds the real faults?
+A.   Isolation Forest (Check 2). In real faults no single metric is extreme;
+     for example interfaces_down goes from 12 to 13 and bgp_peers_down from 6
+     to 8. The COMBINATION is unusual, and Isolation Forest isolates it in about
+     5 cuts. The hard limit is the safety net for obvious extreme values.
+
+----------------------------------------------------------------------
+B5. TRAINING, TESTING AND RESULTS
+----------------------------------------------------------------------
+
+Q31. Why a 75/25 split?
+A.   A common split: enough data to learn normal behaviour (4,050 rows) and
+     enough unseen data to measure results fairly (1,350 rows).
+
+Q32. Why a random split and not a time split (first 75% train, last 25% test)?
+A.   All faults happen between 10:15 and 10:50. The last 25% of the hour
+     (about 10:54-11:09) has no faults at all, so we could not measure recall.
+     A stratified random split puts the same share of faults (5.2%) in both parts.
+
+Q33. Is there any problem with a random split on time-series data?
+A.   Yes, honestly: neighbouring readings (10 seconds apart) look similar, so
+     a test row may have a very similar row in training, which can make results
+     look slightly better. The model is unsupervised and never sees labels,
+     which limits this effect. With longer data, a time-based split would be better.
+
+Q34. Explain precision, recall and F1 with your results.
+A.   Precision 0.56: when Cognify raises an alarm, it is a real fault 56% of the time.
+     Recall 0.66   : it catches 66% of the real fault readings.
+     F1 0.61       : the balance of the two (harmonic mean). 1.0 would be perfect.
+
+Q35. Explain your confusion matrix.
+A.   On 1,350 test rows:
+     1242 correctly normal (no alarm, nothing wrong)
+       37 false alarms     (alarm, but labelled normal)
+       24 missed faults    (fault, but no alarm)
+       47 caught faults    (fault, and an alarm)
+
+Q36. Is F1 = 0.61 good?
+A.   For a simple unsupervised model on real data with subtle faults, it is
+     reasonable. The faults barely change most metrics, the labels are only
+     minute-accurate, and the model never saw a label. Only 2.9% of normal
+     readings raise a false alarm. It is a starting point, not a final system.
+
+Q37. Why does the model miss some faults?
+A.   Some readings inside a fault window look normal: at the start or end of the
+     window, or after the network has already re-routed traffic. Minute-level
+     labels also mark some readings as faults that were already back to normal.
+     The dashboard shows one missed fault as an honest example.
+
+Q38. Why are there false alarms?
+A.   Some flagged rows are on leaf3 after 10:50, after the last fault. The
+     network was probably still settling (BGP peers reconnecting), so they may
+     be real after-effects that the event log does not mark as faults.
+
+Q39. Does an anomaly mean the router has failed?
+A.   No. An anomaly means "statistically unusual compared with this router's
+     normal behaviour". It could be a fault, a planned change or a harmless
+     spike. An engineer must still investigate.
+
+----------------------------------------------------------------------
+B6. THE SYSTEM AND TECHNOLOGY
+----------------------------------------------------------------------
+
+Q40. What technologies did you use?
+A.   Python, pandas, NumPy  - data preparation
+     scikit-learn           - Isolation Forest and the evaluation metrics
+     FastAPI + uvicorn      - small local web server (API)
+     React + TypeScript     - dashboard, built with Vite
+     Tailwind CSS           - styling
+     Recharts               - charts
+
+Q41. Why React and FastAPI instead of Streamlit (suggested in the brief)?
+A.   We started with Streamlit. It is quick to write but limits the layout and
+     chart design. We needed clear, step-by-step explanation views, so we split
+     it: Python keeps all the ML (FastAPI returns JSON) and React draws the
+     dashboard. The ML code did not change.
+
+Q42. How does the dashboard talk to the model?
+A.   React calls the local API:
+     GET  /api/analysis?contamination=0.05  -> data, observations, results, samples
+     POST /api/check                        -> checks one reading (Tab 4)
+     POST /api/upload                       -> load another CSV
+     POST /api/reset                        -> back to the Cisco dataset
+     Everything happens on 127.0.0.1 (this laptop only).
+
+Q43. Can it work with other data?
+A.   Yes. Upload any CSV with the columns timestamp, router_id and the 7 metrics.
+     scenario_label is optional; without it, the evaluation tab is skipped.
+
+Q44. Does it connect to or change real routers?
+A.   No. It only reads a CSV file. It never connects to a router and never
+     changes any configuration.
+
+Q45. How fast is it?
+A.   Training on 4,050 rows takes about one second on a laptop. Checking a
+     single reading is instant.
+
+----------------------------------------------------------------------
+B7. LIMITATIONS AND FUTURE WORK
+----------------------------------------------------------------------
+
+Q46. What are the limitations?
+A.   - Recorded lab data from one hour, not live data.
+     - Only 3 fault types, all on one link.
+     - No latency metric.
+     - Labels are minute-level and approximate.
+     - Random split on time-series data may slightly flatter the results.
+     - Not tested on a real MPLS network.
+
+Q47. What would you do next?
+A.   - Read live telemetry from routers (read-only), e.g. via gNMI or a collector.
+     - Add latency and jitter from IP SLA / TWAMP probes.
+     - Add MPLS metrics: LDP sessions, LSP state, label drops.
+     - Train on days or weeks of data and use a time-based split.
+     - Group alarms into incidents instead of single readings.
+     - Add an offline (local) language model that explains alerts in plain
+       language, still without internet.
+
+Q48. How would you deploy it in a real air-gapped network?
+A.   Install the Python packages from a local folder (pip --no-index), copy the
+     pre-built dashboard and run the server on a machine inside the secure
+     network. The telemetry collector would feed new readings into the model,
+     and the model would be retrained regularly on recent normal data.
+
+----------------------------------------------------------------------
+B8. QUICK ONE-LINE ANSWERS
+----------------------------------------------------------------------
+
+What kind of learning is this?         Unsupervised anomaly detection.
+How many features?                     7 router metrics.
+How many rows?                         5,400 (282 fault rows, 5.2%).
+How many routers?                      15 Cisco IOS-XR routers.
+Train / test rows?                     4,050 / 1,350 (75% / 25%, stratified).
+Number of trees?                       100.
+Contamination?                         0.05 (5%).
+Final rule?                            Anomaly = hard limit broken OR Isolation Forest says unusual.
+Precision / Recall / F1?               0.56 / 0.66 / 0.61.
+False alarm rate on normal rows?       2.9%.
+Typical cuts normal / fault / cut-off? about 15 / about 5-6 / 9.2.
+Where is the code?                     C:\Users\anjur\mpls-copilot-poc
